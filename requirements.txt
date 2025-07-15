@@ -1,0 +1,9 @@
+mediapipe==0.9.1.0
+opencv-python
+numpy
+pyautogui
+pycaw
+pynput
+joblib
+tk
+comtypes
