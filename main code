@@ -1,0 +1,236 @@
+import tkinter as tk
+from threading import Thread
+import cv2
+import mediapipe as mp
+import joblib
+import pyautogui
+import numpy as np
+import time
+import math
+import os
+from pynput.mouse import Controller, Button
+from ctypes import cast, POINTER
+from comtypes import CLSCTX_ALL
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+# Load model and encoder
+model = joblib.load("gesture_rf_model.pkl")
+encoder = joblib.load("gesture_label_encoder.pkl")
+
+# Setup
+mouse = Controller()
+screen_width, screen_height = pyautogui.size()
+devices = AudioUtilities.GetSpeakers()
+interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+volume = cast(interface, POINTER(IAudioEndpointVolume))
+minVol, maxVol = volume.GetVolumeRange()[0], volume.GetVolumeRange()[1]
+
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7)
+mp_draw = mp.solutions.drawing_utils
+
+# Globals
+running = False
+mode = "mouse"
+current_gesture = "None"
+drag_mode = False
+prev_x, prev_y = 0, 0
+last_action_time = {k: 0 for k in ["click", "right_click", "double_click", "screenshot", "scroll", "zoom", "media", "mute"]}
+cooldown = 1.5
+screenshot_dir = "screenshots"
+os.makedirs(screenshot_dir, exist_ok=True)
+
+# Utils
+def get_angle(a, b, c):
+    ba = np.array([a.x - b.x, a.y - b.y])
+    bc = np.array([c.x - b.x, c.y - b.y])
+    cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
+def get_distance(a, b):
+    return math.hypot(a.x - b.x, a.y - b.y)
+
+def classify_gesture(lm):
+    features = [v for pt in lm for v in (pt.x, pt.y, pt.z)]
+    features += [
+        get_angle(lm[5], lm[6], lm[8]),
+        get_angle(lm[9], lm[10], lm[12]),
+        get_distance(lm[4], lm[8])
+    ]
+    if len(features) != model.n_features_in_:
+        return "Unknown"
+    return encoder.inverse_transform([model.predict([features])[0]])[0]
+
+def move_mouse_smooth(tip):
+    global prev_x, prev_y
+    x, y = int(tip.x * screen_width), int(tip.y * screen_height)
+    alpha = 0.3
+    curr_x = int(prev_x * (1 - alpha) + x * alpha)
+    curr_y = int(prev_y * (1 - alpha) + y * alpha)
+    pyautogui.moveTo(curr_x, curr_y)
+    prev_x, prev_y = curr_x, curr_y
+
+def toggle_mute():
+    pyautogui.press('volumemute')
+
+def toggle_play_pause():
+    pyautogui.press('playpause')
+
+def minimize_window():
+    pyautogui.hotkey('win', 'down')
+
+def maximize_window():
+    pyautogui.hotkey('win', 'up')
+
+def gesture_loop():
+    global running, current_gesture, drag_mode
+    cap = cv2.VideoCapture(0)
+    pTime = time.time()
+
+    while running:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.flip(frame, 1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb)
+        current_time = time.time()
+
+        if results.multi_hand_landmarks and results.multi_handedness:
+            hand_map = {}
+            for i, hand_info in enumerate(results.multi_handedness):
+                hand_type = hand_info.classification[0].label
+                hand_map[hand_type] = results.multi_hand_landmarks[i]
+
+            if "Right" in hand_map:
+                lm = hand_map["Right"].landmark
+                current_gesture = classify_gesture(lm)
+                mp_draw.draw_landmarks(frame, hand_map["Right"], mp_hands.HAND_CONNECTIONS)
+
+                dist_thumb_middle = get_distance(lm[4], lm[12]) * 1000
+                if dist_thumb_middle < 30 and current_time - last_action_time["screenshot"] > cooldown:
+                    filename = f"screenshot_{int(time.time())}.png"
+                    pyautogui.screenshot(os.path.join(screenshot_dir, filename))
+                    last_action_time["screenshot"] = current_time
+
+                if mode == "mouse":
+                    angle_index = get_angle(lm[5], lm[6], lm[8])
+                    angle_middle = get_angle(lm[9], lm[10], lm[12])
+                    dist_thumb_index = get_distance(lm[4], lm[8]) * 1000
+
+                    if dist_thumb_index < 40:
+                        if not drag_mode:
+                            drag_mode = True
+                            mouse.press(Button.left)
+                        move_mouse_smooth(lm[8])
+                    else:
+                        if drag_mode:
+                            drag_mode = False
+                            mouse.release(Button.left)
+                        if angle_index < 60 and angle_middle > 80 and dist_thumb_index > 50 and current_time - last_action_time["click"] > cooldown:
+                            mouse.click(Button.left)
+                            last_action_time["click"] = current_time
+                        elif angle_middle < 60 and angle_index > 80 and dist_thumb_index > 50 and current_time - last_action_time["right_click"] > cooldown:
+                            mouse.click(Button.right)
+                            last_action_time["right_click"] = current_time
+                        elif angle_index < 60 and angle_middle < 60 and dist_thumb_index > 50 and current_time - last_action_time["double_click"] > cooldown:
+                            pyautogui.doubleClick()
+                            last_action_time["double_click"] = current_time
+                        else:
+                            move_mouse_smooth(lm[8])
+
+                    # Zoom control
+                    dist_thumb_ring = get_distance(lm[4], lm[16])
+                    dist_thumb_pinky = get_distance(lm[4], lm[20])
+                    if dist_thumb_ring < 0.03 and current_time - last_action_time["zoom"] > cooldown:
+                        pyautogui.hotkey('ctrl', '+')
+                        last_action_time["zoom"] = current_time
+                    elif dist_thumb_pinky < 0.03 and current_time - last_action_time["zoom"] > cooldown:
+                        pyautogui.hotkey('ctrl', '-')
+                        last_action_time["zoom"] = current_time
+
+                elif mode == "volume":
+                    x1, y1 = int(lm[4].x * frame.shape[1]), int(lm[4].y * frame.shape[0])
+                    x2, y2 = int(lm[8].x * frame.shape[1]), int(lm[8].y * frame.shape[0])
+                    length = math.hypot(x2 - x1, y2 - y1)
+                    vol = np.interp(length, [50, 300], [minVol, maxVol])
+                    volume.SetMasterVolumeLevel(vol, None)
+
+            if "Left" in hand_map:
+                lm = hand_map["Left"].landmark
+                mp_draw.draw_landmarks(frame, hand_map["Left"], mp_hands.HAND_CONNECTIONS)
+                thumb = lm[4]
+                index = lm[8]
+                middle = lm[12]
+                ring = lm[16]
+                pinky = lm[20]
+
+                if get_distance(thumb, index) < 0.03 and get_distance(thumb, middle) > 0.1 and current_time - last_action_time["media"] > cooldown:
+                    toggle_play_pause()
+                    last_action_time["media"] = current_time
+                elif get_distance(thumb, middle) < 0.03 and current_time - last_action_time["mute"] > cooldown:
+                    toggle_mute()
+                    last_action_time["mute"] = current_time
+                elif get_distance(thumb, ring) < 0.03 and current_time - last_action_time["media"] > cooldown:
+                    minimize_window()
+                    last_action_time["media"] = current_time
+                elif get_distance(thumb, pinky) < 0.03 and current_time - last_action_time["media"] > cooldown:
+                    maximize_window()
+                    last_action_time["media"] = current_time
+
+        cTime = time.time()
+        fps = 1 / (cTime - pTime + 1e-6)
+        pTime = cTime
+        cv2.putText(frame, f'FPS: {int(fps)}', (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+
+        cv2.imshow("Gesture Control", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    running = False
+
+def start_gesture_control():
+    global running
+    if not running:
+        running = True
+        Thread(target=gesture_loop, daemon=True).start()
+        update_labels()
+
+def stop_gesture_control():
+    global running
+    running = False
+
+def switch_mode():
+    global mode
+    mode = "volume" if mode == "mouse" else "mouse"
+    lbl_mode.config(text=f"Mode: {mode.upper()}")
+
+def update_labels():
+    if running:
+        lbl_status.config(text="Running", fg="green")
+        lbl_mode.config(text=f"Mode: {mode.upper()}")
+        lbl_gesture.config(text=f"Gesture: {current_gesture}")
+        root.after(200, update_labels)
+    else:
+        lbl_status.config(text="Stopped", fg="red")
+
+root = tk.Tk()
+root.title("Gesture Control System")
+root.geometry("400x300")
+root.configure(bg="#222")
+
+tk.Label(root, text="Gesture Control System", font=("Helvetica", 16, "bold"), bg="#222", fg="white").pack(pady=10)
+lbl_status = tk.Label(root, text="Stopped", font=("Helvetica", 14), bg="#222", fg="red")
+lbl_status.pack()
+lbl_mode = tk.Label(root, text="Mode: MOUSE", font=("Helvetica", 12), bg="#222", fg="white")
+lbl_mode.pack(pady=5)
+lbl_gesture = tk.Label(root, text="Gesture: None", font=("Helvetica", 12), bg="#222", fg="lightgreen")
+lbl_gesture.pack(pady=5)
+
+tk.Button(root, text="Start", command=start_gesture_control, width=10, bg="green", fg="white", font=("Helvetica", 12)).pack(pady=10)
+tk.Button(root, text="Stop", command=stop_gesture_control, width=10, bg="red", fg="white", font=("Helvetica", 12)).pack(pady=5)
+tk.Button(root, text="Switch Mode", command=switch_mode, width=15, bg="blue", fg="white", font=("Helvetica", 11)).pack(pady=10)
+
+root.mainloop()
